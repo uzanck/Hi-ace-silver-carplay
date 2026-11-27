@@ -160,6 +160,7 @@ class Iap2UsbMuxHost private constructor(
                 if (receiveBuffer.size >= MUX_HEADER_BYTES) {
                     val length = readU32(receiveBuffer, 4)
                     if (length < MUX_HEADER_BYTES || length > MAX_FRAME_BYTES) {
+                        Log.w("xcertplay-usb", "HiAce diagnostic: invalid mux header protocol=${readU32(receiveBuffer, 0)} length=$length buffered=${receiveBuffer.size}")
                         throw IphoneUsbException.Protocol("Invalid USBMUX frame length $length")
                     }
                     if (receiveBuffer.size >= length) {
