@@ -76,6 +76,7 @@ class LockdownCarKitClient(
                 destinationPort = port.toInt(),
                 timeoutMillis = STEP_TIMEOUT_MILLIS,
             )
+            serviceConnection.enableCarKitTrace()
             val readyStream = if (enableServiceSsl) {
                 TlsDuplexChannel.open(
                     underlying = serviceConnection,

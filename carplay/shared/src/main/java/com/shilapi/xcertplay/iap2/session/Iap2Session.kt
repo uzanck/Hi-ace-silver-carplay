@@ -128,7 +128,7 @@ class Iap2Session private constructor(
             traceContext: String = "wired",
             onTrace: (String) -> Unit = {},
         ): Iap2Session =
-            Iap2Session(Iap2CsmChannel.open(underlying), traceContext, onTrace)
+            Iap2Session(Iap2CsmChannel.open(underlying, onTrace), traceContext, onTrace)
 
         fun openWireless(
             underlying: BlockingDuplexByteStream,

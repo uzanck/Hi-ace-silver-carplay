@@ -19,6 +19,7 @@ class Iap2LinkChannel private constructor(
     private val underlying: BlockingDuplexByteStream,
     private val linkConfig: Iap2LinkConfig,
     private val initiateNegotiation: Boolean,
+    private val diagnostic: ((String) -> Unit)? = null,
 ) : AutoCloseable {
     private data class Command(
         val sessionId: Int,
@@ -174,6 +175,13 @@ class Iap2LinkChannel private constructor(
         if (failure != null) throw failure
     }
 
+    private var traceBudget = 100
+
+    private fun trace(message: String) {
+        if (diagnostic == null || traceBudget-- <= 0) return
+        runCatching { diagnostic.invoke("HiAce link $message") }
+    }
+
     private fun runPump() {
         val engine = Iap2LinkEngine(linkConfig)
         try {
@@ -192,6 +200,7 @@ class Iap2LinkChannel private constructor(
                 ).coerceAtLeast(MINIMUM_RECEIVE_POLL_MILLIS)
                 val received = underlying.recv(RECEIVE_CHUNK_BYTES, waitMillis)
                 if (isClosing()) return
+                if (received != null) trace("RX stream bytes=${received.size}")
                 when {
                     received == null -> Unit
                     received.isEmpty() -> engine.feedEof()
@@ -220,6 +229,7 @@ class Iap2LinkChannel private constructor(
                     }
                 }
             } ?: return
+            trace("dequeued session=${command.sessionId} bytes=${command.bytes.size} engineWritable=${engine.writable()}")
             when (command.sessionId) {
                 Iap2LinkEngine.CONTROL_SESSION_ID -> engine.sendControl(command.bytes, nowMillis())
                 Iap2LinkEngine.FILE_TRANSFER_SESSION_ID -> engine.sendFileTransfer(command.bytes, nowMillis())
@@ -230,7 +240,11 @@ class Iap2LinkChannel private constructor(
 
     private fun flush(engine: Iap2LinkEngine) {
         val bytes = engine.takeOutput()
-        if (bytes.isNotEmpty()) underlying.send(bytes)
+        if (bytes.isNotEmpty()) {
+            trace("TX stream begin bytes=${bytes.size}")
+            underlying.send(bytes)
+            trace("TX stream complete bytes=${bytes.size}")
+        }
     }
 
     /** Returns false when a link terminal event has been observed. */
@@ -242,6 +256,7 @@ class Iap2LinkChannel private constructor(
                         // The engine only emits writable after validating this is positive.
                         peerMaxControlPayloadBytes = engine.peerSynchronization().maxLength - 10
                     }
+                    trace("writable=${event.value} peerPayload=$peerMaxControlPayloadBytes")
                     ready = event.value && !terminated
                     lock.notifyAll()
                 }
@@ -293,6 +308,7 @@ class Iap2LinkChannel private constructor(
     }
 
     private fun finish(failure: Throwable?) {
+        trace("terminal=${failure?.javaClass?.simpleName ?: "closed"}")
         synchronized(lock) {
             finishLocked(failure)
         }
@@ -411,8 +427,8 @@ class Iap2LinkChannel private constructor(
         )
 
         /** Opens and immediately starts a wired iAP2 link, taking ownership of the supplied stream. */
-        fun open(underlying: BlockingDuplexByteStream): Iap2LinkChannel =
-            Iap2LinkChannel(underlying, WIRED_LINK_CONFIG, initiateNegotiation = true)
+        fun open(underlying: BlockingDuplexByteStream, diagnostic: ((String) -> Unit)? = null): Iap2LinkChannel =
+            Iap2LinkChannel(underlying, WIRED_LINK_CONFIG, initiateNegotiation = true, diagnostic = diagnostic)
                 .also { it.worker.start() }
 
         /**

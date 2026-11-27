@@ -248,8 +248,8 @@ class Iap2CsmChannel private constructor(
         private const val DEFAULT_SEND_TIMEOUT_MILLIS = 5_000L
 
         /** Opens the owned iAP2 link over an owned carkit stream. */
-        fun open(underlying: BlockingDuplexByteStream): Iap2CsmChannel =
-            Iap2CsmChannel(Iap2LinkChannel.open(underlying))
+        fun open(underlying: BlockingDuplexByteStream, diagnostic: ((String) -> Unit)? = null): Iap2CsmChannel =
+            Iap2CsmChannel(Iap2LinkChannel.open(underlying, diagnostic))
 
         /** Opens the owned iAP2 link over an owned wireless RFCOMM stream. */
         fun openWireless(underlying: BlockingDuplexByteStream): Iap2CsmChannel =

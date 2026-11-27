@@ -249,6 +249,7 @@ class Iap2UsbMuxHost private constructor(
         connection.onPacket(
             flags = frame[offset + 13].toInt() and 0xff,
             sequence = readU32(frame, offset + 4),
+            acknowledgement = readU32(frame, offset + 8),
             payload = frame.copyOfRange(offset + tcpHeaderBytes, offset + length),
         )
     }
@@ -348,6 +349,15 @@ class Iap2UsbMuxTcpConnection internal constructor(
     private val stateLock = Object()
     private val writeLock = Any()
     private val received = ArrayDeque<ByteArray>()
+    @Volatile private var traceCarKit = false
+    private val traceBudget = java.util.concurrent.atomic.AtomicInteger(100)
+
+    internal fun enableCarKitTrace() { traceCarKit = true }
+
+    private fun trace(message: String) {
+        if (traceCarKit && traceBudget.getAndDecrement() > 0) Log.i("xcertplay-usb", "HiAce CarKit TCP $message")
+    }
+
     private var nextSequence = 0
     private var nextAcknowledgement = 0
     private var connected = false
@@ -366,6 +376,7 @@ class Iap2UsbMuxTcpConnection internal constructor(
                     checkConnectedLocked()
                     nextSequence to nextAcknowledgement
                 }
+                trace("TX begin bytes=$count seq=${sequenceAndAck.first.toUInt()} ack=${sequenceAndAck.second.toUInt()}")
                 host.sendTcp(
                     sourcePort,
                     destinationPort,
@@ -374,6 +385,7 @@ class Iap2UsbMuxTcpConnection internal constructor(
                     TCP_ACK,
                     chunk,
                 )
+                trace("TX complete bytes=$count")
                 synchronized(stateLock) { nextSequence += count }
             }
             offset += count
@@ -486,7 +498,8 @@ class Iap2UsbMuxTcpConnection internal constructor(
         stateLock.notifyAll()
     }
 
-    internal fun onPacket(flags: Int, sequence: Int, payload: ByteArray) {
+    internal fun onPacket(flags: Int, sequence: Int, acknowledgement: Int, payload: ByteArray) {
+        trace("RX flags=0x${flags.toString(16)} seq=${sequence.toUInt()} ack=${acknowledgement.toUInt()} bytes=${payload.size}")
         if ((flags and TCP_RST) != 0) {
             synchronized(stateLock) {
                 failure = IphoneUsbException.DeviceUnavailable("USBMUX TCP connection was reset by the peer")
