@@ -158,9 +158,25 @@ class Iap2UsbMuxHost private constructor(
             synchronized(stateLock) {
                 if (closed) throw IphoneUsbException.DeviceUnavailable("USBMUX host is closed")
                 if (receiveBuffer.size >= MUX_HEADER_BYTES) {
+                    // Affected USB hosts may deliver a zero word before a complete TCP frame.
+                    // Recover only a fully buffered, structurally valid TCP frame, never arbitrary bytes.
+                    if (receiveBuffer.size >= 4 + MUX_HEADER_BYTES + TCP_HEADER_BYTES &&
+                        readU32(receiveBuffer, 0) == 0 &&
+                        readU32(receiveBuffer, 4) == PROTOCOL_TCP
+                    ) {
+                        val candidateLength = readU32(receiveBuffer, 8)
+                        val tcpHeaderBytes = ((receiveBuffer[4 + MUX_HEADER_BYTES + 12].toInt() ushr 4) and 0x0f) * 4
+                        if (candidateLength == receiveBuffer.size - 4 &&
+                            candidateLength in (MUX_HEADER_BYTES + TCP_HEADER_BYTES)..MAX_FRAME_BYTES &&
+                            tcpHeaderBytes in TCP_HEADER_BYTES..(candidateLength - MUX_HEADER_BYTES)
+                        ) {
+                            Log.w("xcertplay-usb", "HiAce: recovered TCP frame after zero prefix length=$candidateLength")
+                            receiveBuffer = receiveBuffer.copyOfRange(4, receiveBuffer.size)
+                        }
+                    }
                     val length = readU32(receiveBuffer, 4)
                     if (length < MUX_HEADER_BYTES || length > MAX_FRAME_BYTES) {
-                        Log.w("xcertplay-usb", "HiAce diagnostic: invalid mux header protocol=${readU32(receiveBuffer, 0)} length=$length buffered=${receiveBuffer.size}")
+                        Log.w("xcertplay-usb", "HiAce diagnostic: invalid mux header protocol=${readU32(receiveBuffer, 0)} length=$length buffered=${receiveBuffer.size} candidateLength=${readU32(receiveBuffer, 8)}")
                         throw IphoneUsbException.Protocol("Invalid USBMUX frame length $length")
                     }
                     if (receiveBuffer.size >= length) {
