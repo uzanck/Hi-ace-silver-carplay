@@ -48,6 +48,8 @@ class Iap2Session private constructor(
         }
     }
 
+    internal fun awaitTransmitted(timeoutMillis: Long): Boolean = channel.awaitTransmitted(timeoutMillis)
+
     fun send(
         endpoint: Iap2Endpoint,
         timeoutMillis: Long = DEFAULT_SEND_TIMEOUT_MILLIS,

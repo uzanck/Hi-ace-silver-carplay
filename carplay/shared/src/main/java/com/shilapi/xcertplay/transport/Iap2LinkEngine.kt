@@ -148,6 +148,9 @@ class Iap2LinkEngine(
 
     fun writable(): Boolean = writable
 
+    /** Worker-only: no accepted payload remains waiting for serialization. */
+    internal fun outboundSerialized(): Boolean = state == State.NORMAL && queued.isEmpty()
+
     fun peerSynchronization(): SynchronizationPayload = peerSynchronization
 
     fun takeOutput(): ByteArray {

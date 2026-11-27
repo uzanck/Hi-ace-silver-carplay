@@ -29,6 +29,9 @@ class Iap2LinkChannel private constructor(
     private val lock = Object()
     private val commands = ArrayDeque<Command>()
     private var commandBytes = 0
+    private var acceptedCommands = 0L
+    private var serializedCommands = 0L // worker only
+    private var transmittedCommands = 0L // guarded by lock
     private val controls = ArrayDeque<ByteArray>()
     private var controlBytes = 0
     private val fileTransfers = ArrayDeque<ByteArray>()
@@ -95,6 +98,15 @@ class Iap2LinkChannel private constructor(
             if (terminated || closing) return false
             return enqueueCommandLocked(Iap2LinkEngine.CONTROL_SESSION_ID, copy)
         }
+    }
+
+    /** Wait for all commands accepted at entry to reach a successful stream send. */
+    internal fun awaitTransmitted(timeoutMillis: Long): Boolean = synchronized(lock) {
+        require(timeoutMillis >= 0)
+        val target = acceptedCommands
+        waitFor(timeoutMillis) { transmittedCommands >= target || terminated || closing }
+        throwTerminalFailureLocked()
+        !terminated && !closing && transmittedCommands >= target
     }
 
     /** Queues one file-transfer-session datagram, waiting for bounded queue capacity. */
@@ -234,6 +246,7 @@ class Iap2LinkChannel private constructor(
                 Iap2LinkEngine.CONTROL_SESSION_ID -> engine.sendControl(command.bytes, nowMillis())
                 Iap2LinkEngine.FILE_TRANSFER_SESSION_ID -> engine.sendFileTransfer(command.bytes, nowMillis())
             }
+            serializedCommands++
             if (isClosing()) return
         }
     }
@@ -244,6 +257,12 @@ class Iap2LinkChannel private constructor(
             trace("TX stream begin bytes=${bytes.size}")
             underlying.send(bytes)
             trace("TX stream complete bytes=${bytes.size}")
+        }
+        if (engine.outboundSerialized()) synchronized(lock) {
+            if (transmittedCommands < serializedCommands) {
+                transmittedCommands = serializedCommands
+                lock.notifyAll()
+            }
         }
     }
 
@@ -369,6 +388,7 @@ class Iap2LinkChannel private constructor(
         if (!hasCommandCapacityLocked(bytes.size)) return false
         commands += Command(sessionId, bytes)
         commandBytes += bytes.size
+        acceptedCommands++
         lock.notifyAll()
         return true
     }

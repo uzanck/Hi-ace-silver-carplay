@@ -86,6 +86,11 @@ class Iap2CsmChannel private constructor(
         }
     }
 
+    internal fun awaitTransmitted(timeoutMillis: Long): Boolean = synchronized(sendLock) {
+        checkOpen()
+        link.awaitTransmitted(timeoutMillis)
+    }
+
     internal fun sendFileTransfer(bytes: ByteArray, timeoutMillis: Long = DEFAULT_SEND_TIMEOUT_MILLIS) {
         requireTimeout(timeoutMillis)
         synchronized(sendLock) {

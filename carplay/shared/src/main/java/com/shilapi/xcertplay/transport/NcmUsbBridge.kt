@@ -97,7 +97,7 @@ class NcmUsbBridge internal constructor(
         }
     }
 
-    /** Reapply the standard filter once after the start-session request is queued.
+    /** Reapply the standard filter once after the start-session request is transmitted.
      * Do not reset the alternate setting here: it could interrupt an active USB session.
      */
     fun refreshAfterCarPlayStart() {
@@ -108,7 +108,7 @@ class NcmUsbBridge internal constructor(
             Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM post-start filter result=$result")
         } finally {
             dataStart.countDown()
-            Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM data gate opened after CarPlayStartSession queued")
+            Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM data gate opened after CarPlayStartSession stream TX confirmed")
         }
     }
 
@@ -177,7 +177,8 @@ class NcmUsbBridge internal constructor(
 
     private fun drainStatus(endpoint: UsbEndpoint) {
         val buffer = ByteArray(endpoint.maxPacketSize.coerceAtLeast(64))
-        var loggedFirst = false
+        var notifications = 0
+        var emptyReads = 0
         while (statusRunning.get()) {
             if (!awaitDataStart(STATUS_READ_TIMEOUT_MILLIS.toLong())) {
                 if (Thread.currentThread().isInterrupted) return
@@ -189,9 +190,11 @@ class NcmUsbBridge internal constructor(
             } catch (_: RuntimeException) {
                 return
             }
-            if (transferred <= 0) continue
-            if (!loggedFirst) {
-                loggedFirst = true
+            if (transferred <= 0) {
+                if (emptyReads++ < 5) Log.i(IphoneCarPlayConfiguration.TAG, "ncm status no data result=$transferred endpoint=0x${endpoint.address.toString(16)}")
+                continue
+            }
+            if (notifications++ < 8) {
                 Log.i(
                     IphoneCarPlayConfiguration.TAG,
                     "ncm status notification bytes=$transferred data=${buffer.copyOf(transferred).hex(32)}",

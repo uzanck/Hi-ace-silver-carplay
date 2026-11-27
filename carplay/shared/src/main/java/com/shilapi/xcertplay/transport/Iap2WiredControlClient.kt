@@ -124,6 +124,10 @@ class Iap2WiredControlClient(
                         stage = Iap2WiredControlStage.CARPLAY_START_SENT
                         carPlayStartSessions++
                         onProgress("iap2 tx=0x4301 carplay-start-session")
+                        if (!session.awaitTransmitted(CONTROL_SEND_TIMEOUT_MILLIS)) {
+                            throw java.io.IOException("CarPlayStartSession stream transmission timed out")
+                        }
+                        onProgress("iap2 0x4301 stream TX confirmed; activating NCM")
                         onCarPlayStart()
                     }
 
