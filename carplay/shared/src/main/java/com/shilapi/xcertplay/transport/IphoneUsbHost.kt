@@ -12,14 +12,11 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
-import android.hardware.usb.UsbRequest
 import android.os.Build
 import android.util.Log
 import java.io.Closeable
 import java.io.IOException
-import java.nio.ByteBuffer
 import java.util.concurrent.Executor
-import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Exact Apple USB identities allowed by the deployment configuration. */
@@ -333,7 +330,7 @@ class Iap2UsbSession internal constructor(
     private val writeLock = Any()
     private var closed = false
     private var failure: IphoneUsbException? = null
-    private var pendingRead: UsbRequest? = null
+    private var loggedReads = 0
 
     fun write(data: ByteArray, timeoutMillis: Int) = synchronized(writeLock) {
         checkOpen()
@@ -347,61 +344,52 @@ class Iap2UsbSession internal constructor(
         }
     }
 
-    /** Returns null only when no completed USB request arrives before [timeoutMillis]. */
+    /** Uses synchronous bulk I/O to avoid vendor UsbRequest/ByteBuffer completion quirks.
+     * Android reports both timeout and transfer failure as a negative result.
+     * Short time slices keep close responsive; the mux host owns the overall deadline.
+     */
     fun read(timeoutMillis: Long): ByteArray? = synchronized(readLock) {
         checkOpen()
         require(timeoutMillis > 0) { "timeoutMillis must be positive" }
-        val request = UsbRequest()
-        var initialized = false
+        val buffer = ByteArray(USBMUX_READ_CHUNK_BYTES)
+        val timeout = minOf(timeoutMillis, 1_000L).toInt()
         try {
-            if (!request.initialize(connection, inEndpoint)) {
-                throw IphoneUsbException.DeviceUnavailable("Android could not initialize USBMUX read request")
-            }
-            initialized = true
-            synchronized(stateLock) {
-                checkOpenLocked()
-                pendingRead = request
-            }
-            val buffer = ByteBuffer.allocateDirect(USBMUX_READ_CHUNK_BYTES)
-            if (!request.queue(buffer)) {
-                throw IphoneUsbException.DeviceUnavailable("Android could not queue USBMUX read request")
-            }
-            val completed = try {
-                connection.requestWait(timeoutMillis)
-            } catch (_: TimeoutException) {
-                drainCancelledRead(request)
+            val transferred = connection.bulkTransfer(inEndpoint, buffer, buffer.size, timeout)
+            checkOpen()
+            if (transferred <= 0) {
+                // Some vendor drivers return an immediate error rather than waiting.
+                Thread.sleep(minOf(timeoutMillis, 10L))
                 return@synchronized null
             }
-            if (completed == null) {
-                throw failSession("Android returned no USBMUX read request")
+            if (transferred > buffer.size) {
+                throw failSession("USBMUX bulk read returned invalid byte count $transferred")
             }
-            if (completed !== request) {
-                throw failSession("Android completed an unexpected USB request")
+            if (loggedReads < 12) {
+                loggedReads++
+                // Report framing metadata only, never pairing records or application data.
+                val header = if (transferred >= 8) {
+                    val protocol = java.nio.ByteBuffer.wrap(buffer, 0, 8).int
+                    val declared = java.nio.ByteBuffer.wrap(buffer, 4, 4).int
+                    if (protocol in 0..2 || protocol == 6) " proto=$protocol declared=$declared" else " unrecognized-header"
+                } else " short-transfer"
+                Log.i("xcertplay-usb", "HiAce bulk RX bytes=$transferred$header")
             }
-            return@synchronized ByteArray(buffer.position()).also {
-                buffer.flip()
-                buffer.get(it)
-            }
+            buffer.copyOf(transferred)
+        } catch (error: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw failSession("USBMUX bulk read interrupted", error)
         } catch (error: IphoneUsbException) {
             throw error
         } catch (error: RuntimeException) {
-            throw failSession("USBMUX read failed", error)
-        } finally {
-            synchronized(stateLock) {
-                if (pendingRead === request) pendingRead = null
-            }
-            if (initialized) request.cancel()
-            request.close()
+            throw failSession("USBMUX bulk read failed", error)
         }
     }
 
     override fun close() {
-        val requestToCancel = synchronized(stateLock) {
+        synchronized(stateLock) {
             if (closed) return
             closed = true
-            pendingRead
         }
-        requestToCancel?.cancel()
         connection.close()
     }
 
@@ -414,20 +402,6 @@ class Iap2UsbSession internal constructor(
         if (closed) throw IphoneUsbException.DeviceUnavailable("USBMUX session is closed")
     }
 
-    private fun drainCancelledRead(request: UsbRequest) {
-        if (!request.cancel()) {
-            throw failSession("Android could not cancel timed out USBMUX read request")
-        }
-        val completed = try {
-            connection.requestWait(CANCEL_DRAIN_TIMEOUT_MILLIS)
-        } catch (_: TimeoutException) {
-            throw failSession("Timed out draining cancelled USBMUX read request")
-        }
-        if (completed !== request) {
-            throw failSession("Android did not drain the cancelled USBMUX read request")
-        }
-    }
-
     private fun failSession(message: String, cause: Throwable? = null): IphoneUsbException.DeviceUnavailable {
         val error = IphoneUsbException.DeviceUnavailable(message, cause)
         synchronized(stateLock) {
@@ -438,7 +412,6 @@ class Iap2UsbSession internal constructor(
 
     private companion object {
         const val USBMUX_READ_CHUNK_BYTES = 65_536
-        const val CANCEL_DRAIN_TIMEOUT_MILLIS = 1_000L
     }
 }
 
