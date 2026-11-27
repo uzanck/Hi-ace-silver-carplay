@@ -71,6 +71,6 @@ jobs:
           bash gradlew :shared:testDebugUnitTest :mobile:assembleDebug --no-daemon --stacktrace
       - uses: actions/upload-artifact@v4
         with:
-          name: HiAce-CarPlay-V1.0.8-NCMNegotiation
+          name: HiAce-CarPlay-V1.0.9-DataGate
           path: carplay/mobile/build/outputs/apk/debug/*.apk
           if-no-files-found: error

@@ -7,6 +7,8 @@ import android.hardware.usb.UsbConstants
 import android.util.Log
 import java.io.Closeable
 import java.util.ArrayDeque
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -47,6 +49,10 @@ class NcmUsbBridge internal constructor(
     private var bufferedSize = 0
     private val readBuffer = ByteArray(inputSize + 4)
     private val refreshedFilter = AtomicBoolean(false)
+    // Keep all NCM endpoint transfers idle during USBMUX/iAP2 bring-up on this USB host.
+    private val dataStart = CountDownLatch(1)
+    private val loggedDeferred = AtomicBoolean(false)
+    private var writeDiagnostics = 0
     private val statusRunning = AtomicBoolean(statusEndpoint != null)
     private val statusThread = statusEndpoint?.let { endpoint ->
         Thread({ drainStatus(endpoint) }, "ncm-status-in").apply {
@@ -59,12 +65,18 @@ class NcmUsbBridge internal constructor(
     fun send(frame: ByteArray, timeoutMillis: Int) = synchronized(writeLock) {
         checkOpen()
         require(timeoutMillis > 0) { "timeoutMillis must be positive" }
+        if (!awaitDataStart(timeoutMillis.toLong())) return@synchronized
+        checkOpen()
         val sequence = synchronized(stateLock) {
             checkOpenLocked()
             this.sequence.also { this.sequence = (this.sequence + 1) and 0xffff }
         }
         val block = Ntb16Codec.buildAligned(frame, sequence, divisor, remainder, alignment, outputSize, outEndpoint.maxPacketSize.coerceAtLeast(1))
         val transferred = connection.bulkTransfer(outEndpoint, block, block.size, timeoutMillis)
+        if (writeDiagnostics < 12) {
+            writeDiagnostics++
+            Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM bulk OUT bytes=${block.size} result=$transferred")
+        }
         // Before StartCarPlaySession the phone keeps the NCM data path NAKed. Android reports the
         // resulting timeout as -1; it is not a detach and later packets must be allowed to retry.
         if (transferred <= 0) {
@@ -91,8 +103,26 @@ class NcmUsbBridge internal constructor(
     fun refreshAfterCarPlayStart() {
         if (!refreshedFilter.compareAndSet(false, true)) return
         checkOpen()
-        val result = connection.controlTransfer(0x21, 0x43, 0x000e, controlId, null, 0, USB_CONTROL_TIMEOUT_MILLIS)
-        Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM post-start filter result=$result")
+        try {
+            val result = connection.controlTransfer(0x21, 0x43, 0x000e, controlId, null, 0, USB_CONTROL_TIMEOUT_MILLIS)
+            Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM post-start filter result=$result")
+        } finally {
+            dataStart.countDown()
+            Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM data gate opened after CarPlayStartSession queued")
+        }
+    }
+
+    private fun awaitDataStart(timeoutMillis: Long): Boolean {
+        if (dataStart.count == 0L) return true
+        if (loggedDeferred.compareAndSet(false, true)) {
+            Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM data gate closed pending CarPlayStartSession")
+        }
+        return try {
+            dataStart.await(timeoutMillis, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
     }
 
     /**
@@ -106,6 +136,8 @@ class NcmUsbBridge internal constructor(
             if (frames.isNotEmpty()) return pollFrame()
 
             val deadline = System.nanoTime() + timeoutMillis * NANOS_PER_MILLISECOND
+            if (!awaitDataStart(timeoutMillis)) return null
+            checkOpen()
             while (true) {
                 drainFrames()
                 if (frames.isNotEmpty()) return pollFrame()
@@ -125,6 +157,7 @@ class NcmUsbBridge internal constructor(
             if (closed) return
             closed = true
         }
+        dataStart.countDown()
         statusThread?.let { thread ->
             try {
                 thread.join(STATUS_READ_TIMEOUT_MILLIS + 250L)
@@ -146,6 +179,11 @@ class NcmUsbBridge internal constructor(
         val buffer = ByteArray(endpoint.maxPacketSize.coerceAtLeast(64))
         var loggedFirst = false
         while (statusRunning.get()) {
+            if (!awaitDataStart(STATUS_READ_TIMEOUT_MILLIS.toLong())) {
+                if (Thread.currentThread().isInterrupted) return
+                continue
+            }
+            if (!statusRunning.get()) return
             val transferred = try {
                 connection.bulkTransfer(endpoint, buffer, buffer.size, STATUS_READ_TIMEOUT_MILLIS)
             } catch (_: RuntimeException) {
