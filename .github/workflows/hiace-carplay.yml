@@ -22,6 +22,10 @@ jobs:
           distribution: temurin
           java-version: '25'
           cache: gradle
+          cache-dependency-path: |
+            carplay/**/*.gradle*
+            carplay/gradle/libs.versions.toml
+            carplay/gradle/wrapper/gradle-wrapper.properties
       - name: Install SDK and NDK
         run: |
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
@@ -33,6 +37,19 @@ jobs:
           grep -E 'platforms;android-(37|CinnamonBun)|build-tools;37' /tmp/sdk-packages.txt || true
           "$SDKMANAGER" --channel=3 'platform-tools' 'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;28.2.13676358'
           test -f "$ANDROID_HOME/platforms/android-37.0/android.jar"
+      - name: Configure preinstalled Java toolchain for CI
+        run: |
+          java -version
+          java -XshowSettings:properties -version 2>&1 | grep 'java.specification.version = 25'
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("settings.gradle.kts")
+          text = p.read_text()
+          block = 'plugins {\n    id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"\n}\n'
+          assert text.count(block) == 1, "Unexpected Foojay settings block"
+          p.write_text(text.replace(block, "", 1))
+          PY
+          echo "org.gradle.java.installations.auto-download=false" >> gradle.properties
       - name: Test and build
         env:
           HIACE_SIGNING_KEYSTORE_BASE64: ${{ secrets.HIACE_SIGNING_KEYSTORE_BASE64 }}
@@ -51,7 +68,7 @@ jobs:
           else
             echo "::warning::Temporary runner debug key; upgrades may require reinstall"
           fi
-          bash gradlew :shared:testDebugUnitTest :mobile:assembleDebug --no-daemon
+          bash gradlew :shared:testDebugUnitTest :mobile:assembleDebug --no-daemon --stacktrace
       - uses: actions/upload-artifact@v4
         with:
           name: HiAce-CarPlay-V1.0.4-BulkUSB
