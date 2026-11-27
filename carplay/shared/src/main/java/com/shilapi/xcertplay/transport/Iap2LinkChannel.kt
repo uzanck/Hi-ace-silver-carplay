@@ -179,7 +179,7 @@ class Iap2LinkChannel private constructor(
 
     private fun trace(message: String) {
         if (diagnostic == null || traceBudget-- <= 0) return
-        runCatching { diagnostic.invoke("HiAce link $message") }
+        runCatching { diagnostic?.invoke("HiAce link $message") }
     }
 
     private fun runPump() {

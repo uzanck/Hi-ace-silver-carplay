@@ -33,6 +33,8 @@ class NcmUsbBridge internal constructor(
     private var failure: IphoneUsbException? = null
     private var sequence = 0
     private var loggedWriteTimeout = false
+    private var readDiagnostics = 0
+    private var readTimeoutDiagnostics = 0
     private val frames = ArrayDeque<ByteArray>()
     private var queuedBytes = 0
     private var buffered = ByteArray(0)
@@ -202,7 +204,19 @@ class NcmUsbBridge internal constructor(
         }
         // Android reports both an ordinary bulk-IN timeout and a NAK as a negative result. Keep
         // polling: USBMUX owns authoritative detach/failure detection for the same phone.
-        if (transferred <= 0) return null
+        if (transferred <= 0) {
+            if (readTimeoutDiagnostics < 5) {
+                readTimeoutDiagnostics++
+                Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM bulk IN no data result=$transferred endpoint=0x${inEndpoint.address.toString(16)}")
+            }
+            return null
+        }
+        if (transferred > readBuffer.size) throw failSession("NCM invalid transfer length $transferred")
+        if (readDiagnostics < 20) {
+            readDiagnostics++
+            val declared = if (transferred >= 12 && readU32(readBuffer, 0) == Ntb16Codec.NTH16_SIG) readU16(readBuffer, 8) else -1
+            Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM bulk IN bytes=$transferred declared=$declared buffered=$bufferedSize")
+        }
         return transferred
     }
 
@@ -279,6 +293,20 @@ class NcmUsbBridge internal constructor(
                     }
                     claimed.add(function.data)
                 }
+                // Read standard NCM parameters for this claimed control interface. Some Apple
+                // functions do not implement all CDC requests; do not fail an otherwise usable link.
+                val parameters = ByteArray(28)
+                val parameterBytes = connection.controlTransfer(
+                    0xa1, 0x80, 0, function.control.id,
+                    parameters, parameters.size, USB_CONTROL_TIMEOUT_MILLIS,
+                )
+                Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM GET_NTB_PARAMETERS result=$parameterBytes" +
+                    if (parameterBytes >= 28) {
+                        val fields = java.nio.ByteBuffer.wrap(parameters).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                        " formats=${fields.getShort(2).toInt() and 0xffff} inMax=${fields.getInt(4).toUInt()}" +
+                            " outMax=${fields.getInt(16).toUInt()} outDivisor=${fields.getShort(20).toInt() and 0xffff}" +
+                            " outRemainder=${fields.getShort(22).toInt() and 0xffff} outAlignment=${fields.getShort(24).toInt() and 0xffff}"
+                    } else "")
                 val altSelected = connection.setInterface(function.data)
                 Log.i(
                     IphoneCarPlayConfiguration.TAG,
@@ -293,6 +321,13 @@ class NcmUsbBridge internal constructor(
                     IphoneCarPlayConfiguration.TAG,
                     "ncm status endpoint=${function.statusIn?.address?.let { "0x${it.toString(16)}" } ?: "none"}",
                 )
+                // Directed, broadcast and all-multicast are needed for IPv6 neighbor discovery.
+                // A standard CDC request scoped only to the NCM control interface; no vendor commands.
+                val filterResult = connection.controlTransfer(
+                    0x21, 0x43, 0x000e, function.control.id,
+                    null, 0, USB_CONTROL_TIMEOUT_MILLIS,
+                )
+                Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM SET_ETHERNET_PACKET_FILTER result=$filterResult iface=${function.control.id}")
                 return NcmUsbBridge(
                     connection,
                     function.bulkOut,
