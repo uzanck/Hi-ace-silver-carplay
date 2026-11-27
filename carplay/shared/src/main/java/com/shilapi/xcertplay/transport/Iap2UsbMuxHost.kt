@@ -25,6 +25,7 @@ class Iap2UsbMuxHost private constructor(
     private var nextSourcePort = FIRST_SOURCE_PORT
     private lateinit var readerThread: Thread
     private var receiveBuffer = ByteArray(0)
+    private val transferFraming = UsbMuxTransferFraming()
 
     private data class MuxFrame(
         val protocol: Int,
@@ -158,16 +159,9 @@ class Iap2UsbMuxHost private constructor(
             synchronized(stateLock) {
                 if (closed) throw IphoneUsbException.DeviceUnavailable("USBMUX host is closed")
                 if (receiveBuffer.size >= MUX_HEADER_BYTES) {
-                    val prefix = UsbMuxPadding.tcpPrefix(receiveBuffer)
-                    if (prefix > 0) {
-                        val candidateLength = readU32(receiveBuffer, prefix + 4)
-                        Log.w("xcertplay-usb", "HiAce: recovered TCP frame prefix=$prefix length=$candidateLength buffered=${receiveBuffer.size}")
-                        // Preserve every byte following the candidate frame for the next read.
-                        receiveBuffer = receiveBuffer.copyOfRange(prefix, receiveBuffer.size)
-                    }
-                    val length = if (prefix == UsbMuxPadding.NEED_MORE) Int.MAX_VALUE else readU32(receiveBuffer, 4)
-                    if (prefix != UsbMuxPadding.NEED_MORE && (length < MUX_HEADER_BYTES || length > MAX_FRAME_BYTES)) {
-                        Log.w("xcertplay-usb", "HiAce diagnostic: invalid mux header protocol=${readU32(receiveBuffer, 0)} length=$length buffered=${receiveBuffer.size} candidateLength=${readU32(receiveBuffer, 8)}")
+                    val length = readU32(receiveBuffer, 4)
+                    if (length < MUX_HEADER_BYTES || length > MAX_FRAME_BYTES) {
+                        Log.w("xcertplay-usb", "HiAce diagnostic: invalid mux header protocol=${readU32(receiveBuffer, 0)} length=$length buffered=${receiveBuffer.size}")
                         throw IphoneUsbException.Protocol("Invalid USBMUX frame length $length")
                     }
                     if (receiveBuffer.size >= length) {
@@ -192,7 +186,11 @@ class Iap2UsbMuxHost private constructor(
             val remainingMillis = (remainingNanos + NANOS_PER_MILLISECOND - 1) / NANOS_PER_MILLISECOND
             val bytes = pipe.read(remainingMillis) ?: continue
             synchronized(stateLock) {
-                receiveBuffer += bytes
+                val normalized = transferFraming.normalize(bytes, receiveBuffer.isEmpty())
+                if (normalized.size != bytes.size) {
+                    Log.i("xcertplay-usb", "HiAce: removed USB transfer trailer bytes=${bytes.size - normalized.size} frame=${normalized.size}")
+                }
+                receiveBuffer += normalized
             }
         }
     }
