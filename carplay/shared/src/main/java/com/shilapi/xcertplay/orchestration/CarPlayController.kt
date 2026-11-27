@@ -1628,6 +1628,7 @@ class CarPlayController(
                 onStopped = { deactivateMediaRemote(csm) },
                 onIncoming = ::onIap2Incoming,
                 onProgress = { message -> debugLog("wired $message") },
+                onCarPlayStart = { ncm.refreshAfterCarPlayStart() },
             )
             onStatus(
                 when (result.terminal) {

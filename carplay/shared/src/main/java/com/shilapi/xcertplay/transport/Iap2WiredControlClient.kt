@@ -32,6 +32,7 @@ class Iap2WiredControlClient(
         onStopped: () -> Unit = {},
         onIncoming: (Iap2Frame) -> Unit = {},
         onProgress: (String) -> Unit = {},
+        onCarPlayStart: () -> Unit = {},
     ): Iap2WiredControlResult {
         require(availableCurrentMilliAmps in 0..0xffff) {
             "availableCurrentMilliAmps must be in 0..65535"
@@ -123,6 +124,7 @@ class Iap2WiredControlClient(
                         stage = Iap2WiredControlStage.CARPLAY_START_SENT
                         carPlayStartSessions++
                         onProgress("iap2 tx=0x4301 carplay-start-session")
+                        onCarPlayStart()
                     }
 
                     Iap2LocationMessages.START_LOCATION_INFORMATION -> {

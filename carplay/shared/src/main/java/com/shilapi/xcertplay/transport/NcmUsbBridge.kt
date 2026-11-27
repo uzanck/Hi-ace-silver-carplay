@@ -23,6 +23,12 @@ class NcmUsbBridge internal constructor(
     private val statusEndpoint: UsbEndpoint?,
     private val claimedInterfaces: List<UsbInterface>,
     descriptorHostMac: ByteArray?,
+    private val controlId: Int,
+    private val inputSize: Int,
+    private val outputSize: Int,
+    private val divisor: Int,
+    private val remainder: Int,
+    private val alignment: Int,
 ) : Closeable {
     private val descriptorMac = descriptorHostMac?.copyOf()
     val hostMac: ByteArray? get() = descriptorMac?.copyOf()
@@ -39,7 +45,8 @@ class NcmUsbBridge internal constructor(
     private var queuedBytes = 0
     private var buffered = ByteArray(0)
     private var bufferedSize = 0
-    private val readBuffer = ByteArray(READ_CHUNK_BYTES)
+    private val readBuffer = ByteArray(inputSize + 4)
+    private val refreshedFilter = AtomicBoolean(false)
     private val statusRunning = AtomicBoolean(statusEndpoint != null)
     private val statusThread = statusEndpoint?.let { endpoint ->
         Thread({ drainStatus(endpoint) }, "ncm-status-in").apply {
@@ -56,7 +63,7 @@ class NcmUsbBridge internal constructor(
             checkOpenLocked()
             this.sequence.also { this.sequence = (this.sequence + 1) and 0xffff }
         }
-        val block = Ntb16Codec.build(frame, sequence)
+        val block = Ntb16Codec.buildAligned(frame, sequence, divisor, remainder, alignment, outputSize, outEndpoint.maxPacketSize.coerceAtLeast(1))
         val transferred = connection.bulkTransfer(outEndpoint, block, block.size, timeoutMillis)
         // Before StartCarPlaySession the phone keeps the NCM data path NAKed. Android reports the
         // resulting timeout as -1; it is not a detach and later packets must be allowed to retry.
@@ -76,6 +83,16 @@ class NcmUsbBridge internal constructor(
             loggedWriteTimeout = false
             Log.i(IphoneCarPlayConfiguration.TAG, "ncm bulk-out became ready")
         }
+    }
+
+    /** Reapply the standard filter once after the start-session request is queued.
+     * Do not reset the alternate setting here: it could interrupt an active USB session.
+     */
+    fun refreshAfterCarPlayStart() {
+        if (!refreshedFilter.compareAndSet(false, true)) return
+        checkOpen()
+        val result = connection.controlTransfer(0x21, 0x43, 0x000e, controlId, null, 0, USB_CONTROL_TIMEOUT_MILLIS)
+        Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM post-start filter result=$result")
     }
 
     /**
@@ -156,7 +173,7 @@ class NcmUsbBridge internal constructor(
             }
             val blockLength = readU16(buffered, 8)
             if (blockLength < 28) throw failSession("Invalid NTB16 block length $blockLength")
-            val padded = blockLength % USB_PACKET_SIZE == 0
+            val padded = blockLength % inEndpoint.maxPacketSize.coerceAtLeast(1) == 0
             val wireLength = blockLength + if (padded) 1 else 0
             if (bufferedSize < wireLength) return
             if (padded && buffered[blockLength].toInt() != 0) {
@@ -293,6 +310,10 @@ class NcmUsbBridge internal constructor(
                     }
                     claimed.add(function.data)
                 }
+                // SET_NTB_FORMAT is only permitted while the data interface is inactive.
+                val inactive = function.inactiveData
+                val inactiveSelected = inactive != null && connection.setInterface(inactive)
+                Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM data alt0 selected=$inactiveSelected")
                 // Read standard NCM parameters for this claimed control interface. Some Apple
                 // functions do not implement all CDC requests; do not fail an otherwise usable link.
                 val parameters = ByteArray(28)
@@ -307,6 +328,25 @@ class NcmUsbBridge internal constructor(
                             " outMax=${fields.getInt(16).toUInt()} outDivisor=${fields.getShort(20).toInt() and 0xffff}" +
                             " outRemainder=${fields.getShort(22).toInt() and 0xffff} outAlignment=${fields.getShort(24).toInt() and 0xffff}"
                     } else "")
+                val fields = java.nio.ByteBuffer.wrap(parameters).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                val validParameters = parameterBytes >= 28 && (fields.getShort(0).toInt() and 0xffff) >= 28
+                val formats = if (validParameters) fields.getShort(2).toInt() and 0xffff else 1
+                val inputSize = if (validParameters) fields.getInt(4).takeIf { it in 2048..65535 }?.coerceAtMost(32764) ?: 16384 else 16384
+                val outputSize = if (validParameters) fields.getInt(16).takeIf { it in 2048..65535 } ?: 16384 else 16384
+                fun validPower(value: Int): Int = if (value in 4..1024 && value and (value - 1) == 0) value else 4
+                val divisor = if (validParameters) validPower(fields.getShort(20).toInt() and 0xffff) else 4
+                val alignment = if (validParameters) validPower(fields.getShort(24).toInt() and 0xffff) else 4
+                val remainder = if (validParameters) (fields.getShort(22).toInt() and 0xffff).takeIf { it < divisor } ?: 0 else 2
+                if (inactiveSelected && formats and 1 != 0) {
+                    val formatResult = connection.controlTransfer(0x21, 0x84, 0, function.control.id, null, 0, USB_CONTROL_TIMEOUT_MILLIS)
+                    Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM SET_NTB_FORMAT NTB16 result=$formatResult")
+                    val sizeBytes = java.nio.ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt(inputSize).array()
+                    val sizeResult = connection.controlTransfer(0x21, 0x86, 0, function.control.id, sizeBytes, sizeBytes.size, USB_CONTROL_TIMEOUT_MILLIS)
+                    Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM SET_NTB_INPUT_SIZE size=$inputSize result=$sizeResult")
+                } else {
+                    Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM explicit format skipped; inactive setting or NTB16 unavailable")
+                }
+                Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM negotiated in=$inputSize out=$outputSize divisor=$divisor remainder=$remainder alignment=$alignment")
                 val altSelected = connection.setInterface(function.data)
                 Log.i(
                     IphoneCarPlayConfiguration.TAG,
@@ -335,6 +375,7 @@ class NcmUsbBridge internal constructor(
                     function.statusIn,
                     claimed,
                     descriptorHostMac,
+                    function.control.id, inputSize, outputSize, divisor, remainder, alignment,
                 )
             } catch (error: Throwable) {
                 for (usbInterface in claimed.asReversed()) {
