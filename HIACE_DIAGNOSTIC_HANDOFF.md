@@ -36,3 +36,8 @@ Goal: stable wired Apple CarPlay on the existing HiAce headunit. A working alter
 ## Hardware diagnostic incident — 2026-11-28 10:38 WIB
 - usbmon absent; debugfs USB devices readable. Active config 6: interface 2 ipheth, NCM 3/4 usbfs (0x88 IN), second NCM 5/6 inactive (0x89 IN at alt1). eth0 NO-CARRIER, RX/TX zero; tun0 RX zero, TX 10 packets. MUSB host behind 1a40:0101 USB2 hub.
 - Headunit rebooted after attempted read of /sys/kernel/debug/musb-hdrc.0.auto/regdump. uptime confirmed 1 minute, sys.boot.reason=reboot. Causal mechanism unconfirmed. DO NOT repeat regdump or access hardware registers, softconnect/testmode, unbind drivers, root or flash. Prioritize normal headunit operation. No new APK or intrusive tests; consider simple cable/other port or known-good phone only when parked and stable.
+
+## Physical port comparison — 2026-11-28
+- Headunit returned to normal after reboot. V1.0.14 re-enabled for physical USB port test.
+- USB 0 and USB 1 both stuck at UI stage 6; USB 2 stuck at stage 3. No full logs for ports 1/2; shared-controller fault is not proven. Use USB 0 as baseline; no need to repeat port comparison.
+- Next low-risk control: another known-good data cable or iPhone if available; otherwise review NCM interface selection and iAP2 declaration offline. Do not read hardware registers or modify kernel/firmware.
