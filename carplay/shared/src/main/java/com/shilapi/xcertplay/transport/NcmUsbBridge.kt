@@ -9,7 +9,6 @@ import android.util.Log
 import java.io.Closeable
 import java.nio.ByteBuffer
 import java.util.concurrent.TimeoutException
-import java.util.concurrent.locks.LockSupport
 import java.util.ArrayDeque
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -57,12 +56,14 @@ class NcmUsbBridge internal constructor(
     private val dataStart = CountDownLatch(1)
     private val loggedDeferred = AtomicBoolean(false)
     private var writeDiagnostics = 0
-    private val statusRunning = AtomicBoolean(statusEndpoint != null)
-    private val statusThread = statusEndpoint?.let { endpoint ->
-        Thread({ drainStatus(endpoint) }, "ncm-status-in").apply {
-            isDaemon = true
-            start()
-        }
+    // Diagnostic: one asynchronous reader on this connection, never two requestWait consumers.
+    private var asyncRequest: UsbRequest? = null
+    private val asyncBuffer = ByteBuffer.allocateDirect(readBuffer.size)
+    private var asyncPending = false
+    private var asyncUnavailable = false
+    private var asyncWaitTimeouts = 0
+    init {
+        Log.i(IphoneCarPlayConfiguration.TAG, "ncm interrupt status reader paused for exclusive asynchronous bulk IN test endpoint=${statusEndpoint?.address?.toString(16)}")
     }
 
     /** Wraps one Ethernet frame in one NTB16 block and writes it to bulk OUT. */
@@ -156,96 +157,81 @@ class NcmUsbBridge internal constructor(
     }
 
     override fun close() {
-        statusRunning.set(false)
         synchronized(stateLock) {
             if (closed) return
             closed = true
         }
         dataStart.countDown()
-        statusThread?.let { thread ->
-            try {
-                thread.join(STATUS_READ_TIMEOUT_MILLIS + 250L)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
+        synchronized(readLock) {
+            val request = asyncRequest
+            if (request != null && asyncPending) {
+                runCatching { request.cancel() }
+                runCatching { connection.requestWait(250L) }
             }
-        }
-        for (usbInterface in claimedInterfaces.asReversed()) {
-            try {
-                connection.releaseInterface(usbInterface)
-            } catch (_: RuntimeException) {
-                // Best-effort release; the connection close below is authoritative.
-            }
-        }
-        connection.close()
-    }
-
-    // CDC notifications use an interrupt endpoint, not USBDEVFS bulk transfer.
-    // Keep at most one asynchronous request pending across wait timeouts.
-    private fun drainStatus(endpoint: UsbEndpoint) {
-        while (statusRunning.get()) {
-            if (awaitDataStart(STATUS_READ_TIMEOUT_MILLIS.toLong())) break
-            if (Thread.currentThread().isInterrupted) return
-        }
-        if (!statusRunning.get()) return
-        val request = UsbRequest()
-        val buffer = ByteBuffer.allocateDirect(endpoint.maxPacketSize.coerceAtLeast(64))
-        var notifications = 0
-        var timeouts = 0
-        try {
-            if (!request.initialize(connection, endpoint)) {
-                Log.w(IphoneCarPlayConfiguration.TAG, "ncm interrupt status initialize failed endpoint=0x${endpoint.address.toString(16)}")
-                return
-            }
-            Log.i(IphoneCarPlayConfiguration.TAG, "ncm interrupt status UsbRequest ready endpoint=0x${endpoint.address.toString(16)}")
-            while (statusRunning.get()) {
-                buffer.clear()
-                if (!request.queue(buffer)) {
-                    Log.w(IphoneCarPlayConfiguration.TAG, "ncm interrupt status queue failed")
-                    return
-                }
-                var completed = false
-                while (statusRunning.get() && !completed) {
-                    val result = try {
-                        connection.requestWait(STATUS_READ_TIMEOUT_MILLIS.toLong())
-                    } catch (_: TimeoutException) {
-                        if (timeouts++ < 5) Log.i(IphoneCarPlayConfiguration.TAG, "ncm interrupt status wait timeout")
-                        continue
-                    }
-                    if (result == null) {
-                        Log.w(IphoneCarPlayConfiguration.TAG, "ncm interrupt status requestWait returned null")
-                        return
-                    }
-                    if (result !== request) {
-                        Log.w(IphoneCarPlayConfiguration.TAG, "ncm interrupt status unexpected completed request")
-                        return
-                    }
-                    completed = true
-                }
-                if (!completed || !statusRunning.get()) return
-                val transferred = buffer.position()
-                if (transferred <= 0) {
-                    LockSupport.parkNanos(20_000_000L)
-                    continue
-                }
-                buffer.flip()
-                val payload = ByteArray(transferred)
-                buffer.get(payload)
-                if (notifications++ < 12) {
-                    val type = if (payload.size >= 2) payload[1].toInt() and 0xff else -1
-                    val value = if (payload.size >= 4) readU16(payload, 2) else -1
-                    Log.i(IphoneCarPlayConfiguration.TAG, "ncm interrupt status notification bytes=$transferred type=$type value=$value data=${payload.hex(32)}")
+            for (usbInterface in claimedInterfaces.asReversed()) {
+                try {
+                    connection.releaseInterface(usbInterface)
+                } catch (_: RuntimeException) {
+                    // Best-effort release; close is authoritative.
                 }
             }
-        } catch (error: RuntimeException) {
-            if (statusRunning.get()) Log.w(IphoneCarPlayConfiguration.TAG, "ncm interrupt status failed", error)
-        } finally {
-            runCatching { request.cancel() }
-            runCatching { request.close() }
+            connection.close()
+            // Do not free the native request while the USB connection may still own its URB.
+            runCatching { request?.close() }
+            asyncRequest = null
+            asyncPending = false
         }
     }
 
-    private fun ByteArray.hex(limit: Int): String =
-        take(limit).joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+    // The read lock protects the sole request, including across wait timeouts.
+    private fun readAsyncOrFallback(timeoutMillis: Long): Int {
+        if (asyncUnavailable) {
+            return connection.bulkTransfer(inEndpoint, readBuffer, readBuffer.size, timeoutMillis.toInt())
+        }
+        var request = asyncRequest
+        if (request == null) {
+            val created = UsbRequest()
+            if (!created.initialize(connection, inEndpoint)) {
+                created.close()
+                asyncUnavailable = true
+                Log.w(IphoneCarPlayConfiguration.TAG, "ncm bulk IN async initialize failed; using synchronous fallback")
+                return connection.bulkTransfer(inEndpoint, readBuffer, readBuffer.size, timeoutMillis.toInt())
+            }
+            request = created
+            asyncRequest = created
+            Log.i(IphoneCarPlayConfiguration.TAG, "ncm bulk IN async initialized buffer=${asyncBuffer.capacity()}")
+        }
+        if (!asyncPending) {
+            asyncBuffer.clear()
+            if (!request.queue(asyncBuffer)) {
+                Log.w(IphoneCarPlayConfiguration.TAG, "ncm bulk IN async queue failed; using synchronous fallback")
+                request.close()
+                asyncRequest = null
+                asyncUnavailable = true
+                return connection.bulkTransfer(inEndpoint, readBuffer, readBuffer.size, timeoutMillis.toInt())
+            }
+            asyncPending = true
+            if (readDiagnostics == 0 && asyncWaitTimeouts == 0) {
+                Log.i(IphoneCarPlayConfiguration.TAG, "ncm bulk IN async queue accepted endpoint=0x${inEndpoint.address.toString(16)}")
+            }
+        }
+        val completed = try {
+            connection.requestWait(timeoutMillis.coerceAtLeast(1L))
+        } catch (_: TimeoutException) {
+            if (asyncWaitTimeouts++ < 5) Log.i(IphoneCarPlayConfiguration.TAG, "ncm bulk IN async wait timeout; request remains queued")
+            return -1
+        }
+        if (completed !== request) {
+            throw failSession("NCM async requestWait returned null or an unexpected request")
+        }
+        asyncPending = false
+        val count = asyncBuffer.position()
+        if (count <= 0) return count
+        if (count > readBuffer.size) throw failSession("NCM async transfer exceeded buffer")
+        asyncBuffer.flip()
+        asyncBuffer.get(readBuffer, 0, count)
+        return count
+    }
 
     private fun drainFrames() {
         while (true) {
@@ -300,7 +286,7 @@ class NcmUsbBridge internal constructor(
             if (readDiagnostics == 0 && readTimeoutDiagnostics == 0) {
                 Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM bulk IN requested buffer=${readBuffer.size} endpoint=0x${inEndpoint.address.toString(16)}")
             }
-            connection.bulkTransfer(inEndpoint, readBuffer, readBuffer.size, timeoutMillis.toInt())
+            readAsyncOrFallback(timeoutMillis)
         } catch (error: RuntimeException) {
             throw failSession("NCM read failed", error)
         }
@@ -351,7 +337,6 @@ class NcmUsbBridge internal constructor(
     companion object {
         private const val READ_CHUNK_BYTES = 32 * 1024
         private const val USB_PACKET_SIZE = 512
-        private const val STATUS_READ_TIMEOUT_MILLIS = 1_000
         private const val MAX_QUEUED_FRAMES = 256
         private const val MAX_QUEUED_BYTES = 1 shl 20
         private const val NANOS_PER_MILLISECOND = 1_000_000L

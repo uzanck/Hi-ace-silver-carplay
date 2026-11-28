@@ -19,3 +19,10 @@ Goal: stable wired Apple CarPlay on the existing HiAce headunit. A working alter
 - Test a smaller negotiated input limit of 8192 bytes (buffer 8196) only when SET_NTB_INPUT_SIZE accepts it; otherwise keep original supported limit. Keep output size, status handling, data gate, IPv6 announcement and authentication unchanged.
 - Hypothesis only: receive transfer size may affect the host. A -1 alone does not prove controller failure. Test live before any further changes.
 - Verify installed version, unplug/replug after app restart and clear logs. Capture early NCM negotiation, gate, announcement, bulk IN/OUT and status. No further alternative app tests unless explicitly requested.
+
+## V1.0.13 test result
+- 8192 input accepted (result=4), actual read buffer 8196. StartSession and IPv6 announcement 116/116 still work, interrupt queue fails, bulk IN remains -1. No AirPlay. Smaller buffers alone did not fix it.
+
+## V1.0.14 AsyncRx
+- Keep accepted 8 KiB input and existing output/IPv6/iAP2. Test Android UsbRequest for bulk IN 0x88 with one pending request across timeouts; pause interrupt reader so there is only one requestWait consumer on this NCM connection. Fall back to synchronous bulk IN if initialization or queue submission fails. No native changes or guard bypass.
+- Look for async queue accepted/failed, wait timeout, and actual inbound bytes. A successful queue does not prove the phone has sent data. If the result is still negative, stop incremental guesswork and investigate USB transport with direct diagnostic evidence or compare supported hardware/USB ports.
