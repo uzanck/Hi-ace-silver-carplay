@@ -240,11 +240,24 @@ class IphoneUsbHost(
                 ?: throw IphoneUsbException.Protocol(
                     "Re-enumerated iPhone exposes no USBMUX CarPlay configuration",
                 )
-            if (!connection.setConfiguration(configuration)) {
-                Log.w(
-                    IphoneCarPlayConfiguration.TAG,
-                    "setConfiguration ${configuration.id} reported failure; claiming anyway",
-                )
+            // GET_CONFIGURATION is a standard read-only USB device request.
+            // Avoid reselecting an already active configuration; it may reset live endpoints.
+            fun activeConfiguration(): Int? {
+                val value = ByteArray(1)
+                val count = connection.controlTransfer(0x80, 0x08, 0, 0, value, 1, 1000)
+                return if (count == 1) value[0].toInt() and 0xff else null
+            }
+            val before = activeConfiguration()
+            Log.i(IphoneCarPlayConfiguration.TAG, "usbmux active configuration before=$before requested=${configuration.id}")
+            if (before != configuration.id) {
+                val selected = connection.setConfiguration(configuration)
+                val after = activeConfiguration()
+                Log.i(IphoneCarPlayConfiguration.TAG, "usbmux setConfiguration result=$selected active=$after")
+                if (after != configuration.id && (after != null || !selected)) {
+                    throw IphoneUsbException.DeviceUnavailable("Could not establish requested USB configuration ${configuration.id}; active=$after")
+                }
+            } else {
+                Log.i(IphoneCarPlayConfiguration.TAG, "usbmux configuration already active; skipping setConfiguration")
             }
             val usbMux = IphoneCarPlayConfiguration.usbMuxInterface(configuration)
                 ?: throw IphoneUsbException.Protocol("CarPlay configuration exposes no USBMUX interface")

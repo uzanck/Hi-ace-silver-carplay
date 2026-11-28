@@ -1524,11 +1524,27 @@ class CarPlayController(
         iphoneHost.openIap2UsbSessionAsync(device, executor) { result ->
             when (result) {
                 is IphoneUsbHost.Iap2SessionResult.Connected -> {
+                    var openedMux: Iap2UsbMuxHost? = null
                     try {
+                        if (closed) {
+                            result.session.close()
+                            return@openIap2UsbSessionAsync
+                        }
+                        debugLog("wired USBMUX handshake starting before NCM")
+                        val host = Iap2UsbMuxHost.open(result.session)
+                        openedMux = host
+                        this.mux = host
+                        debugLog("wired USBMUX host opened before NCM")
+                        if (closed) {
+                            host.close()
+                            return@openIap2UsbSessionAsync
+                        }
                         val ncm = openNcm(device)
-                        runStack(result.session, ncm)
+                        runStack(host, ncm)
                     } catch (error: Throwable) {
-                        result.session.close()
+                        debugLog("wired data path bring-up failed", error)
+                        if (openedMux != null) openedMux.close() else result.session.close()
+                        if (this.mux === openedMux) this.mux = null
                         fail(error)
                     }
                 }
@@ -1555,14 +1571,11 @@ class CarPlayController(
         return NcmUsbBridge.open(connection, function)
     }
 
-    private fun runStack(usbSession: Iap2UsbSession, ncm: NcmUsbBridge) {
+    private fun runStack(mux: Iap2UsbMuxHost, ncm: NcmUsbBridge) {
         phase = Phase.CONTROL
         var ncmOwnedLocally = true
         try {
             if (closed) return
-            val mux = Iap2UsbMuxHost.open(usbSession)
-            this.mux = mux
-            debugLog("wired USBMUX host opened")
             onStatus(CarPlayStatus.Pairing)
             val pairingClient = LockdownPairingClient(mux)
             val savedPairRecord = loadPairRecord()

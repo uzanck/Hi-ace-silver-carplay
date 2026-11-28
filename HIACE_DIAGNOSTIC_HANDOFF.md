@@ -41,3 +41,8 @@ Goal: stable wired Apple CarPlay on the existing HiAce headunit. A working alter
 - Headunit returned to normal after reboot. V1.0.14 re-enabled for physical USB port test.
 - USB 0 and USB 1 both stuck at UI stage 6; USB 2 stuck at stage 3. No full logs for ports 1/2; shared-controller fault is not proven. Use USB 0 as baseline; no need to repeat port comparison.
 - Next low-risk control: another known-good data cable or iPhone if available; otherwise review NCM interface selection and iAP2 declaration offline. Do not read hardware registers or modify kernel/firmware.
+
+## Stage 3 regression and V1.0.15 UsbMuxFirst
+- USB 0 also regressed to stage 3 after port/cable switching. Headunit restart and iPhone restart did not restore stage 6. Logs show config 6 selected, setConfiguration reported false, claim and NCM negotiation successful, then USBMUX version reply timeout after 60 s. No pairing. Cause of absent reply still unknown.
+- Change order: verify active USB configuration with standard GET_CONFIGURATION, skip redundant SET_CONFIGURATION if already active; do not claim when selection is known wrong or failed without confirmation. Perform USBMUX handshake before opening NCM. Keep V1.0.14 NCM transport, MFi and guard unchanged. No hardware register reads, kernel changes or firmware modifications.
+- Target: USBMUX version accepted, host opened before NCM, then normal pairing and stage 6. This addresses the stage 3 regression only; stage 6 still unresolved. Test parked, USB 0, stop on unexpected reboot.
