@@ -32,3 +32,7 @@ Goal: stable wired Apple CarPlay on the existing HiAce headunit. A working alter
 - Stop speculative APK iteration. Neither smaller negotiated input nor asynchronous read alone fixed reception. USB controller/driver issue is plausible, not proven. iPhone-side NCM/session or networking issue also remains possible.
 - Comparable public report: https://github.com/shihabal3amri/DiPlay/issues/1030 (UMS512 Android 10 SPRD MUSB; maintainer suspects host controller, no app fix in that comment; their USBMUX also fails, unlike our observed working iAP2).
 - Next: inspect availability of read-only usbmon on existing firmware and/or test another physical USB data path if available. No root/flash/MCU/CAN changes. If no diagnostic access, acknowledge limits; do not promise another APK will solve it.
+
+## Hardware diagnostic incident — 2026-11-28 10:38 WIB
+- usbmon absent; debugfs USB devices readable. Active config 6: interface 2 ipheth, NCM 3/4 usbfs (0x88 IN), second NCM 5/6 inactive (0x89 IN at alt1). eth0 NO-CARRIER, RX/TX zero; tun0 RX zero, TX 10 packets. MUSB host behind 1a40:0101 USB2 hub.
+- Headunit rebooted after attempted read of /sys/kernel/debug/musb-hdrc.0.auto/regdump. uptime confirmed 1 minute, sys.boot.reason=reboot. Causal mechanism unconfirmed. DO NOT repeat regdump or access hardware registers, softconnect/testmode, unbind drivers, root or flash. Prioritize normal headunit operation. No new APK or intrusive tests; consider simple cable/other port or known-good phone only when parked and stable.
