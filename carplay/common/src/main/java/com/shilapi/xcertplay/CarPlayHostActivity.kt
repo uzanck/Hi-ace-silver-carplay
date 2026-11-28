@@ -1893,7 +1893,8 @@ class CarPlayHostActivity : ComponentActivity() {
         // A rotation onto a declared area is only a view area switch, so it need not wait.
         mainHandler.postDelayed(
             applyDisplaySize,
-            if (session.viewAreas?.turnsWithScreen == true) 0L else DISPLAY_CHANGE_DEBOUNCE_MILLIS,
+            if (activeDisplaySize == null) 2000L
+            else if (session.viewAreas?.turnsWithScreen == true) 0L else DISPLAY_CHANGE_DEBOUNCE_MILLIS,
         )
     }
 
