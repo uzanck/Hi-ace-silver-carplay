@@ -62,6 +62,19 @@ class EthernetIpv6CodecTest {
         assertEquals(0xffff, ipv6IcmpChecksumSum(result))
     }
 
+    @Test
+    fun `advertises the actual wired CarPlay IPv6 address with valid checksum`() {
+        val address = ByteArray(16).also { it[0] = 0xfe.toByte(); it[1] = 0x80.toByte(); it[15] = 2 }
+        val mac = byteArrayOf(0x02, 0, 0, 0, 0, 2)
+        val result = EthernetIpv6Codec.unsolicitedNeighborAdvertisement(address, mac)
+        assertEquals(72, result.size)
+        assertEquals(255, result[7].toInt() and 0xff)
+        assertArrayEquals(address, result.copyOfRange(8, 24))
+        assertArrayEquals(address, result.copyOfRange(48, 64))
+        assertArrayEquals(mac, result.copyOfRange(66, 72))
+        assertEquals(0xffff, ipv6IcmpChecksumSum(result))
+    }
+
     private fun ipv6IcmpChecksumSum(packet: ByteArray): Int {
         val payloadBytes = ((packet[4].toInt() and 0xff) shl 8) or (packet[5].toInt() and 0xff)
         var sum = 0L

@@ -111,6 +111,30 @@ object EthernetIpv6Codec {
         return result
     }
 
+    /** Announce the actual advertised host address to Ethernet peers, not the TUN auto address. */
+    fun unsolicitedNeighborAdvertisement(address: ByteArray, hostMac: ByteArray): ByteArray {
+        require(address.size == 16 && (address[0].toInt() and 0xff) == 0xfe &&
+            (address[1].toInt() and 0xc0) == 0x80)
+        require(hostMac.size == MAC_BYTES)
+        val packet = ByteArray(72)
+        packet[0] = 0x60
+        putU16(packet, IPV6_PAYLOAD_LENGTH_OFFSET, 32)
+        packet[6] = 58
+        packet[7] = 0xff.toByte()
+        address.copyInto(packet, 8)
+        packet[24] = 0xff.toByte()
+        packet[25] = 2
+        packet[39] = 1 // ff02::1
+        packet[40] = 136.toByte()
+        packet[44] = 0x20 // Override, not Solicited; not a router.
+        address.copyInto(packet, 48)
+        packet[64] = 2
+        packet[65] = 1
+        hostMac.copyInto(packet, 66)
+        writeIcmpv6Checksum(packet)
+        return packet
+    }
+
     private fun writeIcmpv6Checksum(ipv6: ByteArray) {
         val payloadBytes = readU16(ipv6, IPV6_PAYLOAD_LENGTH_OFFSET)
         ipv6[IPV6_HEADER_BYTES + 2] = 0

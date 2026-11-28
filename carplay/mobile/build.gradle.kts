@@ -13,8 +13,8 @@ android {
         applicationId = "com.shilapi.xcertplay.hiace"
         minSdk = 28
         targetSdk = 37
-        versionCode = 1423
-        versionName = "1.0.11-hiace"
+        versionCode = 1424
+        versionName = "1.0.12-hiace"
         testInstrumentationRunner = "com.shilapi.xcertplay.CarPlayMediaServiceLifecycleTest"
     }
 

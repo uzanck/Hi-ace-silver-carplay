@@ -23,6 +23,7 @@ class Ipv6NcmBridge(
     private val ncm: NcmUsbBridge,
     private val tun: ParcelFileDescriptor,
     private val hostMac: ByteArray,
+    private val advertisedAddress: ByteArray,
     private val onError: (Throwable) -> Unit,
 ) : Closeable {
     init {
@@ -92,6 +93,16 @@ class Ipv6NcmBridge(
         val input = FileInputStream(tun.fileDescriptor)
         val buffer = ByteArray(TUN_READ_BYTES)
         try {
+            // The TUN emits multicast before iAP2 completes. Wait for the data gate before
+            // consuming packets, then announce the address in CarPlayStartSession explicitly.
+            while (running.get() && !ncm.awaitDataStart(READ_TIMEOUT_MILLIS)) {
+                if (Thread.currentThread().isInterrupted) return
+            }
+            if (!running.get()) return
+            val announcement = EthernetIpv6Codec.unsolicitedNeighborAdvertisement(advertisedAddress, hostMac)
+            val destination = byteArrayOf(0x33, 0x33, 0, 0, 0, 1)
+            Log.i(TAG, "ncm advertised IPv6 neighbor announcement ${announcement.summary(0)}")
+            ncm.send(EthernetIpv6Codec.build(hostMac, destination, announcement), WRITE_TIMEOUT_MILLIS)
             while (running.get()) {
                 val length = input.read(buffer)
                 if (length == -1) {

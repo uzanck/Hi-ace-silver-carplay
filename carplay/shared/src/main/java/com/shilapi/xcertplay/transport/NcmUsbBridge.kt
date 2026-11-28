@@ -47,6 +47,7 @@ class NcmUsbBridge internal constructor(
     private var loggedWriteTimeout = false
     private var readDiagnostics = 0
     private var readTimeoutDiagnostics = 0
+    private var nativeReadProbeAvailable = true
     private val frames = ArrayDeque<ByteArray>()
     private var queuedBytes = 0
     private var buffered = ByteArray(0)
@@ -116,7 +117,7 @@ class NcmUsbBridge internal constructor(
         }
     }
 
-    private fun awaitDataStart(timeoutMillis: Long): Boolean {
+    internal fun awaitDataStart(timeoutMillis: Long): Boolean {
         if (dataStart.count == 0L) return true
         if (loggedDeferred.compareAndSet(false, true)) {
             Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM data gate closed pending CarPlayStartSession")
@@ -297,7 +298,19 @@ class NcmUsbBridge internal constructor(
     private fun readChunk(timeoutMillis: Long): Int? {
         checkOpen()
         val transferred = try {
-            connection.bulkTransfer(inEndpoint, readBuffer, readBuffer.size, timeoutMillis.toInt())
+            // USB Java API collapses errno into -1. Use the same granted usbfs fd and
+            // endpoint for reads, preserving the actual errno; fall back if JNI is unavailable.
+            if (nativeReadProbeAvailable) {
+                try {
+                    NcmUsbNative.bulkRead(connection.fileDescriptor, inEndpoint.address, readBuffer, timeoutMillis.toInt())
+                } catch (unavailable: LinkageError) {
+                    nativeReadProbeAvailable = false
+                    Log.w(IphoneCarPlayConfiguration.TAG, "ncm native bulk read unavailable; using Android API", unavailable)
+                    connection.bulkTransfer(inEndpoint, readBuffer, readBuffer.size, timeoutMillis.toInt())
+                }
+            } else {
+                connection.bulkTransfer(inEndpoint, readBuffer, readBuffer.size, timeoutMillis.toInt())
+            }
         } catch (error: RuntimeException) {
             throw failSession("NCM read failed", error)
         }
@@ -306,7 +319,7 @@ class NcmUsbBridge internal constructor(
         if (transferred <= 0) {
             if (readTimeoutDiagnostics < 5) {
                 readTimeoutDiagnostics++
-                Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM bulk IN no data result=$transferred endpoint=0x${inEndpoint.address.toString(16)}")
+                Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM bulk IN no data result=$transferred errno=${if (nativeReadProbeAvailable && transferred < 0) -transferred else 0} endpoint=0x${inEndpoint.address.toString(16)}")
             }
             return null
         }
