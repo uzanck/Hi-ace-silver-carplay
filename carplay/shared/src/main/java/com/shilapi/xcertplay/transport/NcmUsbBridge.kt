@@ -3,9 +3,13 @@ package com.shilapi.xcertplay.transport
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
+import android.hardware.usb.UsbRequest
 import android.hardware.usb.UsbConstants
 import android.util.Log
 import java.io.Closeable
+import java.nio.ByteBuffer
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.locks.LockSupport
 import java.util.ArrayDeque
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -175,31 +179,68 @@ class NcmUsbBridge internal constructor(
         connection.close()
     }
 
+    // CDC notifications use an interrupt endpoint, not USBDEVFS bulk transfer.
+    // Keep at most one asynchronous request pending across wait timeouts.
     private fun drainStatus(endpoint: UsbEndpoint) {
-        val buffer = ByteArray(endpoint.maxPacketSize.coerceAtLeast(64))
-        var notifications = 0
-        var emptyReads = 0
         while (statusRunning.get()) {
-            if (!awaitDataStart(STATUS_READ_TIMEOUT_MILLIS.toLong())) {
-                if (Thread.currentThread().isInterrupted) return
-                continue
-            }
-            if (!statusRunning.get()) return
-            val transferred = try {
-                connection.bulkTransfer(endpoint, buffer, buffer.size, STATUS_READ_TIMEOUT_MILLIS)
-            } catch (_: RuntimeException) {
+            if (awaitDataStart(STATUS_READ_TIMEOUT_MILLIS.toLong())) break
+            if (Thread.currentThread().isInterrupted) return
+        }
+        if (!statusRunning.get()) return
+        val request = UsbRequest()
+        val buffer = ByteBuffer.allocateDirect(endpoint.maxPacketSize.coerceAtLeast(64))
+        var notifications = 0
+        var timeouts = 0
+        try {
+            if (!request.initialize(connection, endpoint)) {
+                Log.w(IphoneCarPlayConfiguration.TAG, "ncm interrupt status initialize failed endpoint=0x${endpoint.address.toString(16)}")
                 return
             }
-            if (transferred <= 0) {
-                if (emptyReads++ < 5) Log.i(IphoneCarPlayConfiguration.TAG, "ncm status no data result=$transferred endpoint=0x${endpoint.address.toString(16)}")
-                continue
+            Log.i(IphoneCarPlayConfiguration.TAG, "ncm interrupt status UsbRequest ready endpoint=0x${endpoint.address.toString(16)}")
+            while (statusRunning.get()) {
+                buffer.clear()
+                if (!request.queue(buffer)) {
+                    Log.w(IphoneCarPlayConfiguration.TAG, "ncm interrupt status queue failed")
+                    return
+                }
+                var completed = false
+                while (statusRunning.get() && !completed) {
+                    val result = try {
+                        connection.requestWait(STATUS_READ_TIMEOUT_MILLIS.toLong())
+                    } catch (_: TimeoutException) {
+                        if (timeouts++ < 5) Log.i(IphoneCarPlayConfiguration.TAG, "ncm interrupt status wait timeout")
+                        continue
+                    }
+                    if (result == null) {
+                        Log.w(IphoneCarPlayConfiguration.TAG, "ncm interrupt status requestWait returned null")
+                        return
+                    }
+                    if (result !== request) {
+                        Log.w(IphoneCarPlayConfiguration.TAG, "ncm interrupt status unexpected completed request")
+                        return
+                    }
+                    completed = true
+                }
+                if (!completed || !statusRunning.get()) return
+                val transferred = buffer.position()
+                if (transferred <= 0) {
+                    LockSupport.parkNanos(20_000_000L)
+                    continue
+                }
+                buffer.flip()
+                val payload = ByteArray(transferred)
+                buffer.get(payload)
+                if (notifications++ < 12) {
+                    val type = if (payload.size >= 2) payload[1].toInt() and 0xff else -1
+                    val value = if (payload.size >= 4) readU16(payload, 2) else -1
+                    Log.i(IphoneCarPlayConfiguration.TAG, "ncm interrupt status notification bytes=$transferred type=$type value=$value data=${payload.hex(32)}")
+                }
             }
-            if (notifications++ < 8) {
-                Log.i(
-                    IphoneCarPlayConfiguration.TAG,
-                    "ncm status notification bytes=$transferred data=${buffer.copyOf(transferred).hex(32)}",
-                )
-            }
+        } catch (error: RuntimeException) {
+            if (statusRunning.get()) Log.w(IphoneCarPlayConfiguration.TAG, "ncm interrupt status failed", error)
+        } finally {
+            runCatching { request.cancel() }
+            runCatching { request.close() }
         }
     }
 

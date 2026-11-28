@@ -107,6 +107,16 @@ class CarPlayVpnService : VpnService() {
                 .establish()
                 ?: throw IOException("VpnService.establish returned null")
             tun = tunFd
+            // Inspect the actual VPN interface addresses without altering routing or IPv6 packets.
+            runCatching {
+                val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+                if (interfaces != null) for (networkInterface in java.util.Collections.list(interfaces)) {
+                    val addresses = java.util.Collections.list(networkInterface.inetAddresses)
+                    if (addresses.any { it.address.contentEquals(address.address) }) {
+                        Log.i(TAG, "wired VPN IPv6 iface=${networkInterface.name} addresses=${addresses.joinToString { it.hostAddress ?: "unknown" }} advertised=$linkLocal")
+                    }
+                }
+            }.onFailure { Log.w(TAG, "wired VPN IPv6 interface diagnostic failed", it) }
 
             val ipv6Bridge = Ipv6NcmBridge(ncm, tunFd, hostMac) { error ->
                 onTransportError(generation, listener, error)
