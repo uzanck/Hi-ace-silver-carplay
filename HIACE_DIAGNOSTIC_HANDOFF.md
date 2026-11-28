@@ -26,3 +26,9 @@ Goal: stable wired Apple CarPlay on the existing HiAce headunit. A working alter
 ## V1.0.14 AsyncRx
 - Keep accepted 8 KiB input and existing output/IPv6/iAP2. Test Android UsbRequest for bulk IN 0x88 with one pending request across timeouts; pause interrupt reader so there is only one requestWait consumer on this NCM connection. Fall back to synchronous bulk IN if initialization or queue submission fails. No native changes or guard bypass.
 - Look for async queue accepted/failed, wait timeout, and actual inbound bytes. A successful queue does not prove the phone has sent data. If the result is still negative, stop incremental guesswork and investigate USB transport with direct diagnostic evidence or compare supported hardware/USB ports.
+
+## V1.0.14 test result — 2026-11-28 10:33 WIB
+- Bulk IN 0x88 asynchronous initialization and queue accepted (8196 bytes); repeated wait timeouts while request remained queued; no inbound payload observed. Interrupt reader paused as intended. StartSession and IPv6 announcement 116/116 sent; iAP2 updates continue; OUT intermittently times out and recovers. Still stuck at stage 6.
+- Stop speculative APK iteration. Neither smaller negotiated input nor asynchronous read alone fixed reception. USB controller/driver issue is plausible, not proven. iPhone-side NCM/session or networking issue also remains possible.
+- Comparable public report: https://github.com/shihabal3amri/DiPlay/issues/1030 (UMS512 Android 10 SPRD MUSB; maintainer suspects host controller, no app fix in that comment; their USBMUX also fails, unlike our observed working iAP2).
+- Next: inspect availability of read-only usbmon on existing firmware and/or test another physical USB data path if available. No root/flash/MCU/CAN changes. If no diagnostic access, acknowledge limits; do not promise another APK will solve it.
