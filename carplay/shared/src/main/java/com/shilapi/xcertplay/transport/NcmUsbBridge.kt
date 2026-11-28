@@ -297,6 +297,9 @@ class NcmUsbBridge internal constructor(
     private fun readChunk(timeoutMillis: Long): Int? {
         checkOpen()
         val transferred = try {
+            if (readDiagnostics == 0 && readTimeoutDiagnostics == 0) {
+                Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM bulk IN requested buffer=${readBuffer.size} endpoint=0x${inEndpoint.address.toString(16)}")
+            }
             connection.bulkTransfer(inEndpoint, readBuffer, readBuffer.size, timeoutMillis.toInt())
         } catch (error: RuntimeException) {
             throw failSession("NCM read failed", error)
@@ -413,7 +416,8 @@ class NcmUsbBridge internal constructor(
                 val fields = java.nio.ByteBuffer.wrap(parameters).order(java.nio.ByteOrder.LITTLE_ENDIAN)
                 val validParameters = parameterBytes >= 28 && (fields.getShort(0).toInt() and 0xffff) >= 28
                 val formats = if (validParameters) fields.getShort(2).toInt() and 0xffff else 1
-                val inputSize = if (validParameters) fields.getInt(4).takeIf { it in 2048..65535 }?.coerceAtMost(32764) ?: 16384 else 16384
+                val supportedInputSize = if (validParameters) fields.getInt(4).takeIf { it in 2048..65535 }?.coerceAtMost(32764) ?: 16384 else 16384
+                var inputSize = supportedInputSize
                 val outputSize = if (validParameters) fields.getInt(16).takeIf { it in 2048..65535 } ?: 16384 else 16384
                 fun validPower(value: Int): Int = if (value in 4..1024 && value and (value - 1) == 0) value else 4
                 val divisor = if (validParameters) validPower(fields.getShort(20).toInt() and 0xffff) else 4
@@ -422,9 +426,13 @@ class NcmUsbBridge internal constructor(
                 if (inactiveSelected && formats and 1 != 0) {
                     val formatResult = connection.controlTransfer(0x21, 0x84, 0, function.control.id, null, 0, USB_CONTROL_TIMEOUT_MILLIS)
                     Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM SET_NTB_FORMAT NTB16 result=$formatResult")
-                    val sizeBytes = java.nio.ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt(inputSize).array()
+                    // Test smaller USB receive transactions on the UMS512 host; only use the
+                    // reduced limit if the phone accepts the CDC input-size request.
+                    val requestedInputSize = supportedInputSize.coerceAtMost(8192)
+                    val sizeBytes = java.nio.ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt(requestedInputSize).array()
                     val sizeResult = connection.controlTransfer(0x21, 0x86, 0, function.control.id, sizeBytes, sizeBytes.size, USB_CONTROL_TIMEOUT_MILLIS)
-                    Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM SET_NTB_INPUT_SIZE size=$inputSize result=$sizeResult")
+                    if (sizeResult == sizeBytes.size) inputSize = requestedInputSize
+                    Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM SET_NTB_INPUT_SIZE size=$requestedInputSize result=$sizeResult effective=$inputSize")
                 } else {
                     Log.i(IphoneCarPlayConfiguration.TAG, "HiAce NCM explicit format skipped; inactive setting or NTB16 unavailable")
                 }
