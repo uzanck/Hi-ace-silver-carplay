@@ -62,8 +62,97 @@ class NcmUsbBridge internal constructor(
     private var asyncPending = false
     private var asyncUnavailable = false
     private var asyncWaitTimeouts = 0
-    init {
-        Log.i(IphoneCarPlayConfiguration.TAG, "ncm interrupt status reader paused for exclusive asynchronous bulk IN test endpoint=${statusEndpoint?.address?.toString(16)}")
+    // Both endpoints share this connection. Only recv() under readLock calls requestWait.
+    private var statusRequest: UsbRequest? = null
+    private val statusBuffer = ByteBuffer.allocateDirect(statusEndpoint?.maxPacketSize?.coerceAtLeast(1) ?: 16)
+    private var statusPending = false
+    private var statusUnavailable = statusEndpoint == null
+    private var statusLegacyQueue = false
+    private var statusQueueLogged = false
+    private var statusFragments = ByteArray(0)
+    private var statusLogCount = 0
+
+    private fun queueStatus() {
+        if (statusUnavailable || statusPending) return
+        val endpoint = statusEndpoint ?: return
+        val request = statusRequest ?: UsbRequest().also {
+            if (!it.initialize(connection, endpoint)) {
+                it.close()
+                statusUnavailable = true
+                Log.w(IphoneCarPlayConfiguration.TAG, "ncm status initialize failed")
+                return
+            }
+            statusRequest = it
+        }
+        statusBuffer.clear()
+        @Suppress("DEPRECATION")
+        val queued = if (statusLegacyQueue) request.queue(statusBuffer, statusBuffer.capacity()) else {
+            if (request.queue(statusBuffer)) true else {
+                statusBuffer.clear()
+                statusLegacyQueue = true
+                request.queue(statusBuffer, statusBuffer.capacity())
+            }
+        }
+        if (!queued) {
+            statusUnavailable = true
+            Log.w(IphoneCarPlayConfiguration.TAG, "ncm status queue failed (both APIs) endpoint=0x${endpoint.address.toString(16)} packet=${statusBuffer.capacity()}")
+            return
+        }
+        statusPending = true
+        if (!statusQueueLogged) {
+            statusQueueLogged = true
+            Log.i(IphoneCarPlayConfiguration.TAG, "ncm status queue accepted endpoint=0x${endpoint.address.toString(16)} packet=${statusBuffer.capacity()} legacy=$statusLegacyQueue")
+        }
+    }
+
+    private fun consumeStatus() {
+        statusPending = false
+        val count = statusBuffer.position()
+        if (count > 0 && count <= statusBuffer.capacity()) {
+            val bytes = ByteArray(count)
+            statusBuffer.flip()
+            statusBuffer.get(bytes)
+            if (statusLogCount++ < 20) {
+                Log.i(IphoneCarPlayConfiguration.TAG, "ncm status fragment bytes=$count hex=${bytes.joinToString(" ") { "%02x".format(it.toInt() and 0xff) }}")
+            }
+            statusFragments += bytes
+            // CDC notification header is 8 bytes, then little-endian wLength payload.
+            while (statusFragments.size >= 8) {
+                val len = readU16(statusFragments, 6)
+                if (len > 64 || (statusFragments[0].toInt() and 0xff) != 0xa1) {
+                    Log.w(IphoneCarPlayConfiguration.TAG, "ncm status invalid notification header; discarding fragment")
+                    statusFragments = ByteArray(0)
+                    break
+                }
+                if (statusFragments.size < 8 + len) break
+                val code = statusFragments[1].toInt() and 0xff
+                val index = readU16(statusFragments, 4)
+                val value = readU16(statusFragments, 2)
+                if (code == 0x2b && len == 10) {
+                    val field = readU32(statusFragments, 10)
+                    Log.i(IphoneCarPlayConfiguration.TAG, "ncm Apple status 0x2b index=$index linkField=0x${field.toUInt().toString(16)}")
+                } else {
+                    Log.i(IphoneCarPlayConfiguration.TAG, "ncm CDC status code=0x${code.toString(16)} index=$index value=$value length=$len")
+                }
+                statusFragments = statusFragments.copyOfRange(8 + len, statusFragments.size)
+            }
+        }
+        queueStatus()
+    }
+
+    private fun pumpStatus(timeoutMillis: Long) {
+        queueStatus()
+        if (!statusPending) {
+            awaitDataStart(timeoutMillis)
+            return
+        }
+        val completed = try {
+            connection.requestWait(timeoutMillis.coerceAtLeast(1L))
+        } catch (_: TimeoutException) {
+            return
+        }
+        if (completed === statusRequest) consumeStatus()
+        else throw failSession("NCM pre-start status wait returned unexpected request")
     }
 
     /** Wraps one Ethernet frame in one NTB16 block and writes it to bulk OUT. */
@@ -141,7 +230,11 @@ class NcmUsbBridge internal constructor(
             if (frames.isNotEmpty()) return pollFrame()
 
             val deadline = System.nanoTime() + timeoutMillis * NANOS_PER_MILLISECOND
-            if (!awaitDataStart(timeoutMillis)) return null
+            // Drain notifications before the start-session gate opens, without queuing bulk IN yet.
+            if (dataStart.count != 0L) {
+                pumpStatus(timeoutMillis.coerceAtMost(250L))
+                if (dataStart.count != 0L) return null
+            }
             checkOpen()
             while (true) {
                 drainFrames()
@@ -164,8 +257,10 @@ class NcmUsbBridge internal constructor(
         dataStart.countDown()
         synchronized(readLock) {
             val request = asyncRequest
-            if (request != null && asyncPending) {
-                runCatching { request.cancel() }
+            val status = statusRequest
+            if (request != null && asyncPending) runCatching { request.cancel() }
+            if (status != null && statusPending) runCatching { status.cancel() }
+            repeat((if (asyncPending) 1 else 0) + (if (statusPending) 1 else 0)) {
                 runCatching { connection.requestWait(250L) }
             }
             for (usbInterface in claimedInterfaces.asReversed()) {
@@ -178,14 +273,19 @@ class NcmUsbBridge internal constructor(
             connection.close()
             // Do not free the native request while the USB connection may still own its URB.
             runCatching { request?.close() }
+            runCatching { status?.close() }
             asyncRequest = null
             asyncPending = false
+            statusRequest = null
+            statusPending = false
         }
     }
 
-    // The read lock protects the sole request, including across wait timeouts.
+    // The read lock protects both queued requests, including across wait timeouts.
     private fun readAsyncOrFallback(timeoutMillis: Long): Int {
+        queueStatus()
         if (asyncUnavailable) {
+            if (statusPending) pumpStatus(1L)
             return connection.bulkTransfer(inEndpoint, readBuffer, readBuffer.size, timeoutMillis.toInt())
         }
         var request = asyncRequest
@@ -215,14 +315,19 @@ class NcmUsbBridge internal constructor(
                 Log.i(IphoneCarPlayConfiguration.TAG, "ncm bulk IN async queue accepted endpoint=0x${inEndpoint.address.toString(16)}")
             }
         }
-        val completed = try {
-            connection.requestWait(timeoutMillis.coerceAtLeast(1L))
-        } catch (_: TimeoutException) {
-            if (asyncWaitTimeouts++ < 5) Log.i(IphoneCarPlayConfiguration.TAG, "ncm bulk IN async wait timeout; request remains queued")
-            return -1
-        }
-        if (completed !== request) {
-            throw failSession("NCM async requestWait returned null or an unexpected request")
+        val deadline = System.nanoTime() + timeoutMillis * NANOS_PER_MILLISECOND
+        while (true) {
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0) return -1
+            val completed = try {
+                connection.requestWait(((remaining + NANOS_PER_MILLISECOND - 1) / NANOS_PER_MILLISECOND).coerceAtLeast(1L))
+            } catch (_: TimeoutException) {
+                if (asyncWaitTimeouts++ < 5) Log.i(IphoneCarPlayConfiguration.TAG, "ncm bulk IN async wait timeout; request remains queued")
+                return -1
+            }
+            if (completed === request) break
+            if (completed === statusRequest && statusPending) consumeStatus()
+            else throw failSession("NCM async requestWait returned null or an unexpected request")
         }
         asyncPending = false
         val count = asyncBuffer.position()
